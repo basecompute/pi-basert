@@ -1,0 +1,21 @@
+{
+	"name": "pi-basert",
+	"version": "0.1.0",
+	"description": "BaseRT pi extension",
+	"type": "module",
+	"license": "Apache-2.0",
+	"keywords": ["pi-package", "pi-extension", "basert", "basecompute"],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/basecompute/pi-basert.git"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": { "optional": true }
+	}
+}
