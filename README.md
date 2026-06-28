@@ -63,9 +63,8 @@ pi
 /model
 ```
 
-The extension reads the server's context window and default output-token cap
-from `/props` the first time you select a BaseRT model, so pi sizes its context
-budget to match `basert serve --max-context`.
+Multimodal models are tagged `(image)` in the picker, and pi sizes its context
+budget to each model's reported window.
 
 ## Commands
 
@@ -74,7 +73,10 @@ budget to match `basert serve --max-context`.
 ## How it works
 
 - `GET /v1/models` lists the models currently loaded by `basert serve`; each is
-  registered under the `basert` provider via pi's `openai-completions` API.
-- `GET /props` supplies `default_generation_settings.max_context` (context
-  window) and `max_tokens` (default output cap). These are server-global in
-  BaseRT, so one fetch resolves every loaded model.
+  registered under the `basert` provider via pi's `openai-completions` API. Each
+  entry carries `meta.n_ctx` (context window) and `architecture.input_modalities`
+  (e.g. `["text","image"]`), so pi sizes context and flags image-capable models
+  without a second round-trip.
+- `GET /props?model=<id>`, fetched the first time you select a model, supplies
+  the raw `chat_template` (used to detect an `enable_thinking` reasoning toggle)
+  and refines `default_generation_settings.max_context` / `max_tokens`.

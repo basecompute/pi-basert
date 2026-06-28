@@ -13,19 +13,29 @@ import { Compile } from "typebox/compile";
 
 const PROVIDER_ID = "basert";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
-// Fallback context window when /props is unreachable or omits max_context.
+// Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
-// Hard cap on output tokens for models whose /props omits max_tokens. BaseRT
-// generation is otherwise bounded only by the context window.
+// BaseRT generation is bounded only by the context window, so use pi's own
+// default for models whose /props omits a max_tokens.
 const DEFAULT_MAX_TOKENS = 16384;
 const PROPS_TIMEOUT_MS = 120_000;
 
-// GET /v1/models — BaseRT returns the OpenAI-shaped list, no per-model meta.
+// GET /v1/models — BaseRT surfaces per-model n_ctx + input modalities.
 const ModelsResponseSchema = Type.Object({
 	data: Type.Optional(
 		Type.Array(
 			Type.Object({
 				id: Type.String(),
+				architecture: Type.Optional(
+					Type.Object({
+						input_modalities: Type.Optional(Type.Array(Type.String())),
+					}),
+				),
+				meta: Type.Optional(
+					Type.Object({
+						n_ctx: Type.Optional(Type.Number()),
+					}),
+				),
 			}),
 		),
 	),
@@ -33,8 +43,8 @@ const ModelsResponseSchema = Type.Object({
 
 const validateModelsResponse = Compile(ModelsResponseSchema);
 
-// GET /props — BaseRT's introspection snapshot. Server-global (single value
-// shared by every loaded model), unlike llama.cpp's per-model props.
+// GET /props?model=<id> — per-model snapshot with the raw chat template and
+// the server's context window / output cap.
 const PropsResponseSchema = Type.Object({
 	default_generation_settings: Type.Optional(
 		Type.Object({
@@ -42,6 +52,7 @@ const PropsResponseSchema = Type.Object({
 			max_tokens: Type.Optional(Type.Number()),
 		}),
 	),
+	chat_template: Type.Optional(Type.String()),
 	build: Type.Optional(
 		Type.Object({
 			version: Type.Optional(Type.String()),
@@ -55,6 +66,34 @@ const validatePropsResponse = Compile(PropsResponseSchema);
 type BaseRTModel = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["models"]>[number];
 type ExtensionCtx = Parameters<Parameters<ExtensionAPI["on"]>[1]>[1];
 
+// BaseRT template thinking is a boolean toggle, so expose pi's off/medium switch only.
+const TEMPLATE_THINKING_LEVEL_MAP = {
+	minimal: null,
+	low: null,
+	high: null,
+	xhigh: null,
+} satisfies NonNullable<BaseRTModel["thinkingLevelMap"]>;
+
+// Minimal shape needed to update both registered models and pi's active model snapshot.
+type MutableModelMetadata = {
+	reasoning: boolean;
+	thinkingLevelMap?: BaseRTModel["thinkingLevelMap"];
+	compat?: BaseRTModel["compat"];
+	contextWindow: number;
+	maxTokens: number;
+};
+
+// Mark a model as using the chat template's enable_thinking control.
+function applyTemplateThinkingSupport(model: MutableModelMetadata): void {
+	model.reasoning = true;
+	model.thinkingLevelMap = TEMPLATE_THINKING_LEVEL_MAP;
+	model.compat = {
+		...model.compat,
+		// Sends the generic chat_template_kwargs.enable_thinking payload.
+		thinkingFormat: "qwen-chat-template",
+	};
+}
+
 export default async function (pi: ExtensionAPI) {
 	let currentModels: BaseRTModel[] = [];
 
@@ -65,12 +104,12 @@ export default async function (pi: ExtensionAPI) {
 	// started with --api-key, discovery fetches must carry the bearer token too.
 	// When no key is configured the header is ignored, so always sending it is safe.
 	const authHeaders: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
-	const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props`;
+	const propsBase = baseUrl.replace(/\/v1$/, "");
 
 	pi.registerCommand("basert-version", {
 		description: "Get build info of the BaseRT server",
 		handler: async (_args, ctx) => {
-			const response = await fetch(propsUrl, { headers: authHeaders });
+			const response = await fetch(`${propsBase}/props`, { headers: authHeaders });
 			if (!response.ok) {
 				ctx.ui.notify(`[basert] /props returned ${response.status}`, "error");
 				return;
@@ -116,17 +155,28 @@ export default async function (pi: ExtensionAPI) {
 
 			currentModels = (payload.data ?? []).map((model) => {
 				const previous = previousById.get(model.id);
-				// /v1/models carries no context window; preserve any value already
-				// discovered from /props across refreshes, else fall back.
-				const contextWindow = previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+				const modalities = model.architecture?.input_modalities ?? ["text"];
+				const input = modalities.filter(
+					(m): m is "text" | "image" => m === "text" || m === "image",
+				);
+				const suffixes: string[] = [];
+				if (input.includes("image")) {
+					suffixes.push("(image)");
+				}
+				const contextWindow =
+					model.meta?.n_ctx ?? previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
 				return {
 					id: model.id,
-					name: model.id,
-					reasoning: false,
-					input: ["text"],
+					name: suffixes.length > 0 ? `${model.id} ${suffixes.join(" ")}` : model.id,
+					// /v1/models does not include /props-discovered capabilities, so preserve
+					// template thinking metadata across refreshes.
+					reasoning: previous?.reasoning ?? false,
+					thinkingLevelMap: previous?.thinkingLevelMap,
+					input,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow,
 					maxTokens: previous?.maxTokens ?? Math.min(DEFAULT_MAX_TOKENS, contextWindow),
+					compat: previous?.compat,
 				} as BaseRTModel;
 			});
 
@@ -147,11 +197,8 @@ export default async function (pi: ExtensionAPI) {
 		}
 	}
 
-	// /props is server-global, so a single fetch resolves the context window and
-	// output cap for every loaded model. Guarded so it runs at most once per
-	// server unless a refresh clears it.
-	let propsDiscovered = false;
-	let pendingProps = false;
+	const discoveredMetadata = new Set<string>();
+	const pendingMetadata = new Set<string>();
 	let statusTimeout: ReturnType<typeof setTimeout> | undefined;
 
 	function clearFooterStatusTimeout(): void {
@@ -161,32 +208,43 @@ export default async function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function discoverProps(
+	async function discoverModelMetadata(
+		modelId: string,
 		ctx?: ExtensionCtx,
 		timeoutMs = PROPS_TIMEOUT_MS,
-		selectedModel?: BaseRTModel,
+		selectedModel?: MutableModelMetadata,
 	): Promise<void> {
-		if (propsDiscovered) {
-			// Re-registration does not refresh pi's active model snapshot, so copy
-			// the already-discovered values into the selected model when available.
-			if (selectedModel && currentModels.length > 0) {
-				selectedModel.contextWindow = currentModels[0].contextWindow;
-				selectedModel.maxTokens = currentModels[0].maxTokens;
+		const model = currentModels.find((m) => m.id === modelId);
+		if (!model) {
+			return;
+		}
+		if (discoveredMetadata.has(modelId)) {
+			// Provider re-registration does not update pi's active model snapshot, so copy
+			// already-discovered metadata into the selected model when available.
+			if (selectedModel) {
+				selectedModel.contextWindow = model.contextWindow;
+				selectedModel.maxTokens = model.maxTokens;
+				if (model.reasoning) {
+					selectedModel.reasoning = model.reasoning;
+					selectedModel.thinkingLevelMap = model.thinkingLevelMap;
+					selectedModel.compat = model.compat;
+				}
 			}
 			return;
 		}
-		if (pendingProps) {
+		if (pendingMetadata.has(modelId)) {
 			return;
 		}
 
-		pendingProps = true;
+		pendingMetadata.add(modelId);
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		const propsUrl = `${propsBase}/props?model=${encodeURIComponent(modelId)}`;
 
 		try {
 			const response = await fetch(propsUrl, { headers: authHeaders, signal: controller.signal });
 			if (!response.ok) {
-				ctx?.ui.notify(`[basert] /props returned ${response.status}`, "error");
+				ctx?.ui.notify(`[basert] /props for ${modelId} returned ${response.status}`, "error");
 				return;
 			}
 			const data: unknown = await response.json();
@@ -194,40 +252,49 @@ export default async function (pi: ExtensionAPI) {
 				const errors = [...validatePropsResponse.Errors(data)]
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
-				ctx?.ui.notify(`[basert] invalid /props response: ${errors}`, "error");
+				ctx?.ui.notify(`[basert] invalid /props response for ${modelId}: ${errors}`, "error");
 				return;
 			}
 
 			const maxContext = data.default_generation_settings?.max_context;
 			const serverMaxTokens = data.default_generation_settings?.max_tokens;
+			let updated = false;
+			let footerStatus: string | undefined;
 			if (typeof maxContext === "number" && maxContext > 0) {
-				const maxTokens =
+				model.contextWindow = maxContext;
+				model.maxTokens =
 					typeof serverMaxTokens === "number" && serverMaxTokens > 0
 						? Math.min(serverMaxTokens, maxContext)
 						: Math.min(DEFAULT_MAX_TOKENS, maxContext);
-				for (const model of currentModels) {
-					model.contextWindow = maxContext;
-					model.maxTokens = maxTokens;
-				}
-				if (selectedModel) {
-					selectedModel.contextWindow = maxContext;
-					selectedModel.maxTokens = maxTokens;
-				}
-				if (ctx) {
-					ctx.ui.setStatus(
-						PROVIDER_ID,
-						ctx.ui.theme.fg("dim", `[basert] context ${maxContext} tokens`),
-					);
-					clearFooterStatusTimeout();
-					statusTimeout = setTimeout(() => {
-						statusTimeout = undefined;
-						ctx.ui.setStatus(PROVIDER_ID, undefined);
-					}, 8000);
-				}
+				footerStatus = `[basert] ${modelId} context ${maxContext} tokens`;
+				updated = true;
 			}
-
-			propsDiscovered = true;
-
+			if (selectedModel) {
+				selectedModel.contextWindow = model.contextWindow;
+				selectedModel.maxTokens = model.maxTokens;
+			}
+			if (data.chat_template?.includes("enable_thinking") === true) {
+				applyTemplateThinkingSupport(model);
+				if (selectedModel) {
+					applyTemplateThinkingSupport(selectedModel);
+					if (pi.getThinkingLevel() === "off") {
+						pi.setThinkingLevel("medium");
+					}
+				}
+				updated = true;
+			}
+			discoveredMetadata.add(modelId);
+			if (footerStatus && ctx) {
+				ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", footerStatus));
+				clearFooterStatusTimeout();
+				statusTimeout = setTimeout(() => {
+					statusTimeout = undefined;
+					ctx.ui.setStatus(PROVIDER_ID, undefined);
+				}, 8000);
+			}
+			if (!updated) {
+				return;
+			}
 			pi.registerProvider(PROVIDER_ID, {
 				name: "BaseRT",
 				baseUrl,
@@ -238,10 +305,10 @@ export default async function (pi: ExtensionAPI) {
 		} catch (error) {
 			const err = error as Error;
 			const msg = err.name === "AbortError" ? "timeout" : err.message;
-			ctx?.ui.notify(`[basert] /props failed: ${msg}`, "error");
+			ctx?.ui.notify(`[basert] /props for ${modelId} failed: ${msg}`, "error");
 		} finally {
 			clearTimeout(timer);
-			pendingProps = false;
+			pendingMetadata.delete(modelId);
 		}
 	}
 
@@ -258,7 +325,7 @@ export default async function (pi: ExtensionAPI) {
 		if (event.model.provider !== PROVIDER_ID) {
 			return;
 		}
-		void discoverProps(ctx, PROPS_TIMEOUT_MS, event.model);
+		void discoverModelMetadata(event.model.id, ctx, PROPS_TIMEOUT_MS, event.model);
 	});
 
 	// Discover /props for already-active models because re-selecting them does not emit model_select.
@@ -267,7 +334,7 @@ export default async function (pi: ExtensionAPI) {
 		if (typeof modelId === "string") {
 			const activeModel =
 				ctx.model?.provider === PROVIDER_ID && ctx.model.id === modelId ? ctx.model : undefined;
-			void discoverProps(ctx, PROPS_TIMEOUT_MS, activeModel);
+			void discoverModelMetadata(modelId, ctx, PROPS_TIMEOUT_MS, activeModel);
 		}
 	});
 
