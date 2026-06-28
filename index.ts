@@ -26,6 +26,8 @@ const ModelsResponseSchema = Type.Object({
 		Type.Array(
 			Type.Object({
 				id: Type.String(),
+				// false for known-but-unloaded (autoload) models.
+				loaded: Type.Optional(Type.Boolean()),
 				architecture: Type.Optional(
 					Type.Object({
 						input_modalities: Type.Optional(Type.Array(Type.String())),
@@ -52,6 +54,9 @@ const PropsResponseSchema = Type.Object({
 			max_tokens: Type.Optional(Type.Number()),
 		}),
 	),
+	// Present only when /props was queried with ?model=. False when the model
+	// is known but not yet loaded (and chat_template is then omitted).
+	loaded: Type.Optional(Type.Boolean()),
 	chat_template: Type.Optional(Type.String()),
 	build: Type.Optional(
 		Type.Object({
@@ -163,6 +168,12 @@ export default async function (pi: ExtensionAPI) {
 				if (input.includes("image")) {
 					suffixes.push("(image)");
 				}
+				// Surface autoload state: unmarked = resident, "(unloaded)" = will
+				// load into VRAM on first use. `loaded` is omitted by older servers,
+				// in which case we say nothing rather than guess.
+				if (model.loaded === false) {
+					suffixes.push("(unloaded)");
+				}
 				const contextWindow =
 					model.meta?.n_ctx ?? previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
 				return {
@@ -239,16 +250,23 @@ export default async function (pi: ExtensionAPI) {
 		pendingMetadata.add(modelId);
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
-		const propsUrl = `${propsBase}/props?model=${encodeURIComponent(modelId)}`;
+		// autoload=1 brings a known-but-unloaded model into VRAM so we can read
+		// its real template/context now — and it's warm for the first request.
+		const propsUrl = `${propsBase}/props?model=${encodeURIComponent(modelId)}&autoload=1`;
 
 		try {
+			if (ctx) {
+				ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", `[basert] loading: ${modelId}`));
+			}
 			const response = await fetch(propsUrl, { headers: authHeaders, signal: controller.signal });
 			if (!response.ok) {
+				ctx?.ui.setStatus(PROVIDER_ID, undefined);
 				ctx?.ui.notify(`[basert] /props for ${modelId} returned ${response.status}`, "error");
 				return;
 			}
 			const data: unknown = await response.json();
 			if (!validatePropsResponse.Check(data)) {
+				ctx?.ui.setStatus(PROVIDER_ID, undefined);
 				const errors = [...validatePropsResponse.Errors(data)]
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
@@ -256,17 +274,24 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 
+			let updated = false;
+			// Model is resident now (autoload=1 loaded it) — drop the "(unloaded)"
+			// tag from its label so the picker reflects reality.
+			if (data.loaded === true && model.name.includes("(unloaded)")) {
+				model.name = model.name.replace(" (unloaded)", "");
+				updated = true;
+			}
+
 			const maxContext = data.default_generation_settings?.max_context;
 			const serverMaxTokens = data.default_generation_settings?.max_tokens;
-			let updated = false;
-			let footerStatus: string | undefined;
+			let footerStatus = data.loaded === true ? `[basert] ${modelId} loaded` : undefined;
 			if (typeof maxContext === "number" && maxContext > 0) {
 				model.contextWindow = maxContext;
 				model.maxTokens =
 					typeof serverMaxTokens === "number" && serverMaxTokens > 0
 						? Math.min(serverMaxTokens, maxContext)
 						: Math.min(DEFAULT_MAX_TOKENS, maxContext);
-				footerStatus = `[basert] ${modelId} context ${maxContext} tokens`;
+				footerStatus = `[basert] ${modelId} loaded (context ${maxContext} tokens)`;
 				updated = true;
 			}
 			if (selectedModel) {
@@ -284,13 +309,19 @@ export default async function (pi: ExtensionAPI) {
 				updated = true;
 			}
 			discoveredMetadata.add(modelId);
-			if (footerStatus && ctx) {
-				ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", footerStatus));
-				clearFooterStatusTimeout();
-				statusTimeout = setTimeout(() => {
-					statusTimeout = undefined;
+			if (ctx) {
+				if (footerStatus) {
+					// Briefly show the loaded/context line, then clear the loading status.
+					ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", footerStatus));
+					clearFooterStatusTimeout();
+					statusTimeout = setTimeout(() => {
+						statusTimeout = undefined;
+						ctx.ui.setStatus(PROVIDER_ID, undefined);
+					}, 8000);
+				} else {
+					// Nothing to report — clear the "loading…" status we set above.
 					ctx.ui.setStatus(PROVIDER_ID, undefined);
-				}, 8000);
+				}
 			}
 			if (!updated) {
 				return;
@@ -303,6 +334,7 @@ export default async function (pi: ExtensionAPI) {
 				models: currentModels,
 			});
 		} catch (error) {
+			ctx?.ui.setStatus(PROVIDER_ID, undefined);
 			const err = error as Error;
 			const msg = err.name === "AbortError" ? "timeout" : err.message;
 			ctx?.ui.notify(`[basert] /props for ${modelId} failed: ${msg}`, "error");
