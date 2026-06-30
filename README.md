@@ -53,9 +53,9 @@ This extension supports the following environment variables:
 # 1. Install BaseRT
 curl -LsSf https://basecompute.co/install.sh | sh
 
-# 2. Pull a model and start the server
+# 2. Pull a model and start the server (serves on port 8080 by default)
 basert pull Qwen/Qwen3-0.6B
-basert serve --model ~/.cache/baseRT/models/Qwen3-0.6B.base --port 8080
+basert serve Qwen/Qwen3-0.6B
 
 # Optional: point at a remote BaseRT server instead of local
 export BASERT_BASE_URL="https://basert.example.com/v1"
@@ -92,3 +92,11 @@ and pi sizes its context budget to each model's reported window.
 
 When a model exposes an `enable_thinking` template toggle, pi's thinking level is
 sent as `chat_template_kwargs.enable_thinking`, which `basert serve` honors.
+
+## Troubleshooting
+
+**`Error: 404 Model not found`** — pi is requesting a model your `basert serve`
+instance isn't currently serving (usually a model selected in a previous
+session, e.g. an old `*.base` file). The provider only exposes what the server
+actually serves, so run `/model` and pick a model from the list. Confirm what's
+available with `curl http://localhost:8080/v1/models`.
