@@ -1,6 +1,6 @@
 {
 	"name": "pi-basert",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "BaseRT pi extension",
 	"type": "module",
 	"license": "Apache-2.0",
