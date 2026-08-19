@@ -124,6 +124,60 @@ export default async function (pi: ExtensionAPI) {
 	const authHeaders: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
 	const propsBase = baseUrl.replace(/\/v1$/, "");
 
+	// WORKAROUND for a basert-serve template bug: older chat templates
+	// (Qwen3 0.6B/4B/8B era) render OpenAI structured content arrays as
+	// garbage — the model literally never sees the user's message and
+	// confabulates one ("waiting for your query…"), which broke coding on
+	// exactly those models while Qwen3.5-era templates and cloud
+	// providers worked. pi always sends content as arrays, so until the
+	// serve flattens them itself, rewrite text-only content arrays into
+	// plain strings on every chat request to this provider. Messages with
+	// image parts pass through untouched.
+	function flattenTextContent(body: string): string {
+		try {
+			const payload = JSON.parse(body) as { messages?: Array<{ content?: unknown }> };
+			if (!Array.isArray(payload?.messages)) {
+				return body;
+			}
+			let changed = false;
+			for (const message of payload.messages) {
+				const content = message?.content;
+				if (
+					Array.isArray(content) &&
+					content.length > 0 &&
+					content.every(
+						(part) =>
+							typeof part === "object" &&
+							part !== null &&
+							(part as { type?: string }).type === "text" &&
+							typeof (part as { text?: unknown }).text === "string",
+					)
+				) {
+					message.content = content.map((part) => (part as { text: string }).text).join("\n\n");
+					changed = true;
+				}
+			}
+			return changed ? JSON.stringify(payload) : body;
+		} catch {
+			return body;
+		}
+	}
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+		const url =
+			typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+		if (
+			init?.method === "POST" &&
+			typeof init.body === "string" &&
+			url.startsWith(baseUrl) &&
+			url.includes("/chat/completions")
+		) {
+			init = { ...init, body: flattenTextContent(init.body) };
+		}
+		return originalFetch(input, init);
+	}) as typeof fetch;
+
 	pi.registerCommand("basert-version", {
 		description: "Get build info of the BaseRT server",
 		handler: async (_args, ctx) => {
