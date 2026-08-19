@@ -18,6 +18,19 @@ const DEFAULT_CONTEXT_WINDOW = 8192;
 // BaseRT generation is bounded only by the context window, so use pi's own
 // default for models whose /props omits a max_tokens.
 const DEFAULT_MAX_TOKENS = 16384;
+// Until /props reveals the serve-enforced window, assume the smallest
+// window `basert serve` launches with. /v1/models' n_ctx is the model's
+// TRAINED window, which routinely exceeds what the running serve
+// enforces — and the serve hard-rejects max_tokens above its window
+// ("max_tokens must be an integer in [1, N]"), killing the whole turn
+// with no tool calls and no reply. A too-small assumption merely costs
+// one early compaction until discovery corrects it upward; a too-big
+// one is a 400 on every request.
+const PRE_DISCOVERY_CONTEXT_WINDOW = 4096;
+const PRE_DISCOVERY_MAX_TOKENS = 4096;
+// `basert serve`'s stock --max-tokens default. /props reports it whether
+// or not the operator set one, so this exact value reads as "unset".
+const SERVE_STOCK_MAX_TOKENS = 2048;
 const PROPS_TIMEOUT_MS = 120_000;
 
 // GET /v1/models — BaseRT surfaces per-model n_ctx + input modalities.
@@ -174,8 +187,15 @@ export default async function (pi: ExtensionAPI) {
 				if (model.loaded === false) {
 					suffixes.push("(unloaded)");
 				}
+				// `previous` first: it carries the /props-discovered window,
+				// which a list refresh must not revert to the trained n_ctx.
+				// Before discovery, clamp to the pre-discovery floor — n_ctx
+				// only ever LOWERS the assumption (a model trained under 4k
+				// stays under it).
 				const contextWindow =
-					model.meta?.n_ctx ?? previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+					previous?.contextWindow ??
+					Math.min(model.meta?.n_ctx ?? DEFAULT_CONTEXT_WINDOW,
+						PRE_DISCOVERY_CONTEXT_WINDOW);
 				return {
 					id: model.id,
 					name: suffixes.length > 0 ? `${model.id} ${suffixes.join(" ")}` : model.id,
@@ -186,7 +206,8 @@ export default async function (pi: ExtensionAPI) {
 					input,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow,
-					maxTokens: previous?.maxTokens ?? Math.min(DEFAULT_MAX_TOKENS, contextWindow),
+					maxTokens: previous?.maxTokens
+						?? Math.min(PRE_DISCOVERY_MAX_TOKENS, contextWindow),
 					compat: previous?.compat,
 				} as BaseRTModel;
 			});
@@ -287,8 +308,17 @@ export default async function (pi: ExtensionAPI) {
 			let footerStatus = data.loaded === true ? `[basert] ${modelId} loaded` : undefined;
 			if (typeof maxContext === "number" && maxContext > 0) {
 				model.contextWindow = maxContext;
+				// default_generation_settings.max_tokens is what the serve
+				// applies to requests that OMIT max_tokens — not a request
+				// ceiling (the ceiling is the window). Honoring the stock
+				// default would cap every agent turn at 2048 tokens on a
+				// 32k window, and thinking models burn that on reasoning
+				// before emitting a tool call — an empty turn with no
+				// calls and no reply. Only a non-stock value is an
+				// operator's explicit cap.
 				model.maxTokens =
 					typeof serverMaxTokens === "number" && serverMaxTokens > 0
+						&& serverMaxTokens !== SERVE_STOCK_MAX_TOKENS
 						? Math.min(serverMaxTokens, maxContext)
 						: Math.min(DEFAULT_MAX_TOKENS, maxContext);
 				footerStatus = `[basert] ${modelId} loaded (context ${maxContext} tokens)`;
