@@ -42,7 +42,7 @@ developing.
 
 This extension supports the following environment variables:
 
-- `BASERT_BASE_URL` (Default: `http://localhost:8080/v1`)
+- `BASERT_BASE_URL` (Default: `http://localhost:8453/v1`)
 - `BASERT_API_KEY` (Default: `no-key`) — sent as `Authorization: Bearer …` to
   both the OpenAI chat endpoint and the discovery endpoints (`/v1/models`,
   `/props`). Required if you started the server with `--api-key`.
@@ -53,7 +53,7 @@ This extension supports the following environment variables:
 # 1. Install BaseRT
 curl -LsSf https://basecompute.co/install.sh | sh
 
-# 2. Pull a model and start the server (serves on port 8080 by default)
+# 2. Pull a model and start the server (serves on port 8453 by default)
 basert pull Qwen/Qwen3-0.6B
 basert serve Qwen/Qwen3-0.6B
 
@@ -99,4 +99,4 @@ sent as `chat_template_kwargs.enable_thinking`, which `basert serve` honors.
 instance isn't currently serving (usually a model selected in a previous
 session, e.g. an old `*.base` file). The provider only exposes what the server
 actually serves, so run `/model` and pick a model from the list. Confirm what's
-available with `curl http://localhost:8080/v1/models`.
+available with `curl http://localhost:8453/v1/models`.

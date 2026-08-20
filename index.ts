@@ -12,7 +12,7 @@ import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 
 const PROVIDER_ID = "basert";
-const DEFAULT_BASE_URL = "http://localhost:8080/v1";
+const DEFAULT_BASE_URL = "http://localhost:8453/v1";
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
 // BaseRT generation is bounded only by the context window, so use pi's own
